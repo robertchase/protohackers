@@ -1,4 +1,5 @@
 import asyncio
+from collections import defaultdict
 from struct import pack, unpack
 
 
@@ -11,8 +12,8 @@ CAMERA = 0x80
 DISPATCHER = 0x81
 
 
-roads = {}  # asycio.Queue instances by road for tickets
-days_by_plate = {}  # set(day numbers of tickets) by plate
+roads = defaultdict(asyncio.Queue)  # queue by road for tickets
+days_by_plate = defaultdict(set)  # set(day numbers of tickets) by plate
 observations = []  # [[timestamp, road, mile, plate], ...]
 
 
@@ -44,7 +45,7 @@ async def heartbeat(writer, delay):
 def check_observations(plate, road, limit):
     obs = sorted([[ts, ml] for ts, rd, ml, pt in observations
                  if plate == pt and rd == road])
-    ticket_days = days_by_plate.get(plate, set())
+    ticket_days = days_by_plate[plate]
     t1, m1 = obs[0]
     for t2, m2 in obs[1:]:
         days = set((int(t1 / 86400), int(t2 / 86400)))
@@ -57,18 +58,16 @@ def check_observations(plate, road, limit):
                 ticket(plate, road, m1, t1, m2, t2, int(speed * 100))
                 ticket_days.update(days)
         t1, m1 = t2, m2
-    days_by_plate[plate] = ticket_days
 
 
 def ticket(plate, road, m1, t1, m2, t2, speed):
-    queue = roads.setdefault(road, asyncio.Queue())
     value = pack(f"!BB{len(plate)}sHHLHLH", TICKET, len(plate),
                  bytes(plate, "ascii"), road, m1, t1, m2, t2, speed)
-    queue.put_nowait(value)
+    roads[road].put_nowait(value)
 
 
 async def dispatch(road, writer):
-    queue = roads.setdefault(road, asyncio.Queue())
+    queue = roads[road]
     while not writer.is_closing():
         ticket = await queue.get()
         writer.write(ticket)
@@ -80,9 +79,10 @@ async def on_connect(reader, writer):
     print(f"connection from {host}:{port}")
     heartbeat_task = None
     client_type = None
+    dispatchers = []
 
     try:
-        while not writer.is_closing():
+        while not reader.at_eof():
             if not (packet_type := await reader.readexactly(1)):
                 break
             packet_type = ord(packet_type)
@@ -99,7 +99,7 @@ async def on_connect(reader, writer):
 
             elif packet_type == PLATE:
                 if client_type != CAMERA:
-                    raise Exception("PLATE only valid for camera")
+                    raise Exception("plate packet only valid for camera")
                 plate = await read_string(reader)
                 timestamp = await read_u32(reader)
                 print(f"plate {port} {road=}, {mile=}, {plate=}")
@@ -115,7 +115,8 @@ async def on_connect(reader, writer):
                 for i in range(road_count):
                     road = await read_u16(reader)
                     print(f"dispatch {port}, {road=}")
-                    asyncio.create_task(dispatch(road, writer))
+                    dispatchers.append(asyncio.create_task(
+                        dispatch(road, writer), name=f"dispatch {road=}"))
 
             elif packet_type == WANT_HEARTBEAT:
                 if heartbeat_task:
@@ -127,7 +128,7 @@ async def on_connect(reader, writer):
 
             else:
                 raise Exception(
-                    f"{port=} illegal packet: {hex(ord(packet_type))}")
+                    f"{port=} illegal packet: {hex(packet_type)}")
     except Exception as exc:
         err_string = str(exc)
         writer.write(pack("!BB", ERROR, len(err_string)))
@@ -136,6 +137,9 @@ async def on_connect(reader, writer):
         print(f"closed connection {host}:{port}")
         if heartbeat_task:
             heartbeat_task.cancel()
+        for dsp in dispatchers:
+            print(f"closing {dsp.get_name()}")
+            dsp.cancel()
         writer.close()
 
 
